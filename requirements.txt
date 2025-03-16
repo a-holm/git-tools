@@ -1,0 +1,5 @@
+﻿requests
+pandas
+openai
+scikit-learn
+numpy
