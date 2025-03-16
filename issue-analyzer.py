@@ -1,5 +1,6 @@
 import requests
 import pandas as pd
+from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
@@ -9,6 +10,9 @@ from itertools import combinations
 from collections import defaultdict
 from openai import OpenAI
 
+# Load environment variables from .env file
+load_dotenv()
+
 # ======== CONFIGURATION ========
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 REPO_OWNER = "mannaandpoem"
@@ -16,7 +20,7 @@ REPO_NAME = "OpenManus"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL_NAME = "gemini-2.0-flash"  # Set model here
-RATE_LIMIT = 10  # Requests per minute
+RATE_LIMIT = 2000  # Requests per minute
 # ===============================
 
 # Initialize rate limiting
@@ -50,15 +54,15 @@ CATEGORIES = [
     "API Issue", "Installation Issue", "Security Issue"
 ]
 
-def fetch_all_issues():
-    """Fetch all issues from the repository."""
-    all_issues = []
+def fetch_open_issues():
+    """Fetch only open issues from the repository."""
+    open_issues = []
     page = 1
     
     while True:
         headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
         url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/issues"
-        params = {"state": "all", "per_page": 100, "page": page}
+        params = {"state": "open", "per_page": 100, "page": page}  # Changed "all" to "open"
         
         response = requests.get(url, headers=headers, params=params)
         
@@ -71,10 +75,14 @@ def fetch_all_issues():
         if not issues:
             break
             
-        all_issues.extend(issues)
+        # Filter out pull requests (GitHub API returns PRs as issues)
+        actual_issues = [issue for issue in issues if "pull_request" not in issue]
+        open_issues.extend(actual_issues)
+        
         page += 1
         
-    return all_issues
+    print(f"Found {len(open_issues)} open issues")
+    return open_issues
 
 def categorize_issue_with_ai(issue):
     """Use Gemini (via OpenAI compatibility) to categorize an issue."""
@@ -106,6 +114,40 @@ def categorize_issue_with_ai(issue):
     except Exception as e:
         print(f"Error categorizing issue {issue['number']}: {e}")
         return "Uncategorized"
+    
+def assess_issue_difficulty(issue):
+    """Use Gemini AI to assess if the issue is an easy fix and provide notes."""
+    title = issue["title"]
+    body = issue.get("body", "") or ""
+    
+    content = f"Title: {title}\nBody: {body}"
+    
+    try:
+        response = rate_limited_api_call(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert at assessing GitHub issues. Determine if the following issue is an easy fix. If it is, provide a brief note on how to fix it. Respond with 'Easy Fix: Yes' or 'Easy Fix: No' followed by 'Notes: ' and your notes if applicable."
+                },
+                {"role": "user", "content": content}
+            ],
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Parse the response
+        if "Easy Fix: Yes" in response_text:
+            is_easy_fix = True
+            notes = response_text.split("Notes: ")[1] if "Notes: " in response_text else ""
+        else:
+            is_easy_fix = False
+            notes = ""
+        
+        return is_easy_fix, notes
+    except Exception as e:
+        print(f"Error assessing issue {issue['number']}: {e}")
+        return False, ""
 
 def find_duplicates(issues, threshold=0.85):
     """Find potential duplicate issues using TF-IDF and cosine similarity."""
@@ -136,11 +178,16 @@ def find_duplicates(issues, threshold=0.85):
 def find_ai_suggested_duplicates(issues, max_pairs=100):
     """Use Gemini AI to identify potential duplicate issues."""
     ai_suggested_duplicates = []
+    pairs_checked = 0
     
     total_pairs = len(issues) * (len(issues) - 1) // 2
     print(f"Checking all {total_pairs} possible pairs...")
     
     for i, j in combinations(range(len(issues)), 2):
+        # print for every 1000 pairs
+        if pairs_checked % 1000 == 0:
+            print(f"Checked {pairs_checked} pairs so far...")
+
         issue1 = issues[i]
         issue2 = issues[j]
         
@@ -162,6 +209,7 @@ def find_ai_suggested_duplicates(issues, max_pairs=100):
             is_duplicate = response.choices[0].message.content.strip().lower()
             
             if is_duplicate == 'yes':
+                print(f" potential duplicate found between issues #{issue1['number']} and #{issue2['number']}")
                 ai_suggested_duplicates.append({
                     'issue1_number': issue1['number'],
                     'issue1_title': issue1['title'],
@@ -179,7 +227,7 @@ def find_ai_suggested_duplicates(issues, max_pairs=100):
 
 def main():
     print("Fetching issues...")
-    issues = fetch_all_issues()
+    issues = fetch_open_issues()
     print(f"Found {len(issues)} issues")
     
     # Categorize issues
@@ -192,6 +240,9 @@ def main():
         category = categorize_issue_with_ai(issue)
         category_counts[category] += 1
         
+        # Assess issue difficulty
+        is_easy_fix, fix_notes = assess_issue_difficulty(issue)
+        
         categorized_issues.append({
             'number': issue['number'],
             'title': issue['title'],
@@ -199,7 +250,9 @@ def main():
             'created_at': issue['created_at'],
             'updated_at': issue['updated_at'],
             'url': issue['html_url'],
-            'category': category
+            'category': category,
+            'is_easy_fix': is_easy_fix,  # New column
+            'fix_notes': fix_notes      # New column
         })
     
     # Find potential duplicates using TF-IDF
@@ -208,7 +261,7 @@ def main():
     
     # Find potential duplicates using AI
     print("Finding potential duplicates using AI...")
-    ai_duplicates = find_ai_suggested_duplicates(issues[:50])  # Limit to first 50 issues to avoid too many API calls
+    ai_duplicates = find_ai_suggested_duplicates(issues)
     
     # Output results
     df_issues = pd.DataFrame(categorized_issues)

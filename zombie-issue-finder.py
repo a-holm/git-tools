@@ -1,11 +1,15 @@
 import requests
 import re
 import pandas as pd
+from dotenv import load_dotenv
 from datetime import datetime
 import time
 import base64
 from openai import OpenAI
 import os
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ======== CONFIGURATION ========
 # GitHub API configuration
@@ -15,8 +19,8 @@ REPO_NAME = "OpenManus"
 
 # Gemini API setup via OpenAI compatibility layer
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")  # Set this in your environment variables
-MODEL_NAME = "gemini-2.0-flash"  # Set the model here
-RATE_LIMIT = 10  # Requests per minute
+MODEL_NAME = "gemini-2.0-pro-exp-02-05"  # Set the model here
+RATE_LIMIT = 5  # Requests per minute
 # ===============================
 
 # Initialize rate limiting
@@ -78,34 +82,81 @@ def get_open_issues():
     print(f"Found {len(open_issues)} open issues")
     return open_issues
 
-def get_merged_pull_requests(limit=30):
-    """Fetch recent merged pull requests"""
-    url = f"{base_url}/pulls"
-    params = {"state": "closed", "per_page": 100}
-    merged_prs = []
+
+def get_all_pull_requests():
+    """Fetch all relevant PRs (open PRs and closed PRs that were merged)"""
+    all_prs = []
     
-    while True and len(merged_prs) < limit:
+    # First fetch open PRs
+    print("Fetching open PRs...")
+    url = f"{base_url}/pulls"
+    params = {"state": "open", "per_page": 100}
+    
+    while True:
         response = requests.get(url, headers=headers, params=params)
         if response.status_code != 200:
-            print(f"Error fetching PRs: {response.status_code}")
+            print(f"Error fetching open PRs: {response.status_code}")
             break
             
         page_prs = response.json()
         if not page_prs:
             break
             
-        # Filter to only include merged PRs
-        merged_page_prs = [pr for pr in page_prs if pr.get("merged_at")]
-        merged_prs.extend(merged_page_prs[:limit - len(merged_prs)])
+        for pr in page_prs:
+            if pr["base"]["ref"] != 'main':  # Only include PRs targeting main:
+                continue
+            all_prs.append({
+                "number": pr["number"],
+                "title": pr["title"],
+                "state": "open",
+                "merged": False,
+                "merged_at": None,
+                "created_at": pr["created_at"],
+                "base_branch": pr["base"]["ref"],
+                "url": pr["html_url"]
+            })
         
-        # Check for pagination
-        if 'next' in response.links and len(merged_prs) < limit:
+        if 'next' in response.links:
             url = response.links['next']['url']
         else:
             break
     
-    print(f"Found {len(merged_prs)} merged pull requests")
-    return merged_prs
+    # Then fetch closed AND merged PRs
+    print("Fetching merged PRs...")
+    url = f"{base_url}/pulls"
+    params = {"state": "closed", "per_page": 100}
+    
+    while True:
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            print(f"Error fetching closed PRs: {response.status_code}")
+            break
+            
+        page_prs = response.json()
+        if not page_prs:
+            break
+            
+        for pr in page_prs:
+            if pr.get("merged_at"):  # Only include actually merged PRs
+                all_prs.append({
+                    "number": pr["number"],
+                    "title": pr["title"],
+                    "state": "closed",
+                    "merged": True,
+                    "merged_at": pr["merged_at"],
+                    "created_at": pr["created_at"],
+                    "base_branch": pr["base"]["ref"],
+                    "url": pr["html_url"]
+                })
+        
+        if 'next' in response.links:
+            url = response.links['next']['url']
+        else:
+            break
+    
+    print(f"Found {len(all_prs)} relevant PRs ({len([p for p in all_prs if p['state'] == 'open'])} open, {len([p for p in all_prs if p['merged']])} merged)")
+    return all_prs
+
 
 def get_pr_commits(pr_number):
     """Get commits for a specific PR"""
@@ -147,14 +198,14 @@ def ai_analyze_potential_fixes(issue, pr_data):
     
     # Get diffs for the commits
     commit_diffs = []
-    for commit in commits[:3]:  # Limit to first 3 commits to avoid too much content
+    for commit in commits[:10]:  # Limit to first 10 commits to avoid too much content
         commit_sha = commit["sha"]
         commit_message = commit["commit"]["message"]
         diff = get_commit_diff(commit_sha)
         
         # Limit diff size to avoid token limits
-        if len(diff) > 3000:
-            diff = diff[:3000] + "... [diff truncated]"
+        if len(diff) > 7000:
+            diff = diff[:7000] + "... [diff truncated]"
             
         commit_diffs.append({
             "message": commit_message,
@@ -167,11 +218,11 @@ def ai_analyze_potential_fixes(issue, pr_data):
 
     ISSUE #{issue_number}:
     Title: {issue_title}
-    Description: {issue_body[:1000]}{"..." if len(issue_body) > 1000 else ""}
+    Description: {issue_body[:6000]}{"..." if len(issue_body) > 6000 else ""}
 
     PULL REQUEST #{pr_number}:
     Title: {pr_title}
-    Description: {pr_body[:1000]}{"..." if len(pr_body) > 1000 else ""}
+    Description: {pr_body[:6000]}{"..." if len(pr_body) > 6000 else ""}
 
     COMMITS & CHANGES:
     """
@@ -179,7 +230,7 @@ def ai_analyze_potential_fixes(issue, pr_data):
     for i, commit in enumerate(commit_diffs):
         prompt += f"\nCOMMIT {i+1}:\n"
         prompt += f"Message: {commit['message']}\n"
-        prompt += f"Changes:\n{commit['diff'][:1500]}{'...' if len(commit['diff']) > 1500 else ''}\n"
+        prompt += f"Changes:\n{commit['diff'][:5000]}{'...' if len(commit['diff']) > 5000 else ''}\n"
     
     prompt += """
     Based on the issue description and the changes in the PR, please analyze:
@@ -236,73 +287,109 @@ def ai_analyze_potential_fixes(issue, pr_data):
 
 
 def find_zombie_issues():
-    """Find zombie issues - open issues that may have been fixed by merged PRs"""
+    """Find zombie issues - open issues that may have been fixed by PRs"""
     open_issues = get_open_issues()
-    merged_prs = get_merged_pull_requests(limit=30)  # Limit to 30 most recent PRs
+    relevant_prs = get_all_pull_requests()
     
-    zombie_candidates = []
+    zombie_issues_merged_prs = []
+    zombie_issues_open_prs = []
     
-    # For each open issue, check against merged PRs
-    for issue in open_issues[:20]:  # Limit to 20 issues to avoid excessive API calls
+    for issue in open_issues:
         issue_number = issue["number"]
         print(f"Analyzing issue #{issue_number}: {issue['title']}")
         
-        for pr in merged_prs:
-            pr_number = pr["number"]
+        for pr in relevant_prs:
+            # Skip PRs merged before the issue existed
+            issue_created_at = datetime.strptime(issue["created_at"], "%Y-%m-%dT%H:%M:%SZ")
             
-            # Skip obvious non-matches to save API calls
-            # If PR came before issue was created, it can't fix it
-            if datetime.strptime(pr["merged_at"], "%Y-%m-%dT%H:%M:%SZ") < datetime.strptime(issue["created_at"], "%Y-%m-%dT%H:%M:%SZ"):
+            if pr["merged"] and datetime.strptime(pr["merged_at"], "%Y-%m-%dT%H:%M:%SZ") < issue_created_at:
                 continue
                 
-            print(f"  Checking against PR #{pr_number}")
+            print(f"  Checking against PR #{pr['number']} ({pr['state']}, base: {pr['base_branch']})")
             
-            # Use AI to analyze if this PR might fix the issue
             analysis = ai_analyze_potential_fixes(issue, pr)
             
-            # If the AI thinks this PR likely fixes the issue, add it to our candidates
             if analysis.get("likely_fixes_issue") and analysis.get("confidence") in ["High", "Medium"]:
-                zombie_candidates.append({
-                    "issue_number": issue_number,
+                # Flattened data structure
+                candidate = {
+                    # Issue info
+                    "issue_number": issue["number"],
                     "issue_title": issue["title"],
                     "issue_url": issue["html_url"],
-                    "pr_number": pr_number,
+                    "issue_created_at": issue["created_at"],
+                    
+                    # PR info
+                    "pr_number": pr["number"],
                     "pr_title": pr["title"],
-                    "pr_url": pr["html_url"],
-                    "pr_merged_at": pr["merged_at"],
+                    "pr_url": pr["url"],
+                    "pr_state": pr["state"],
+                    "pr_merged": pr["merged"],
+                    "pr_merged_at": pr.get("merged_at"),
+                    "pr_base_branch": pr["base_branch"],
+                    "pr_created_at": pr["created_at"],
+                    
+                    # Analysis results
                     "confidence": analysis.get("confidence"),
                     "reasoning": analysis.get("reasoning"),
                     "relevant_changes": analysis.get("relevant_changes")
-                })
+                }
+                
+                # Separate into appropriate lists
+                if pr['merged']:
+                    zombie_issues_merged_prs.append(candidate)
+                else:
+                    zombie_issues_open_prs.append(candidate)
+                
                 print(f"    ✓ Potential fix found with {analysis.get('confidence')} confidence")
-                break  # Move to next issue once we find a likely fix
-            
-            # Avoid hitting rate limits
-            time.sleep(1)
+                
+                # Break condition for merged PRs targeting main
+                if (analysis.get('confidence') == 'High' 
+                    and pr['merged'] 
+                    and pr['base_branch'] == 'main'):
+                    print("    🚨 High confidence merged fix for main branch - moving to next issue")
+                    break
     
-    return zombie_candidates
+    return zombie_issues_merged_prs, zombie_issues_open_prs
+
 
 def main():
     print("Finding zombie issues (open issues that are likely fixed)...")
-    zombie_issues = find_zombie_issues()
+    zombie_issues_merged_prs, zombie_issues_open_prs = find_zombie_issues()
     
-    print(f"\nFound {len(zombie_issues)} potential zombie issues")
+    print(f"\nFound {len(zombie_issues_merged_prs)} zombie issues likely fixed by merged PRs")
+    print(f"Found {len(zombie_issues_open_prs)} zombie issues likely fixed by open PRs")
     
-    # Convert to DataFrame and save to CSV
-    if zombie_issues:
-        df = pd.DataFrame(zombie_issues)
-        df.to_csv("zombie_issues.csv", index=False)
-        print("Results saved to zombie_issues.csv")
+    # Save zombie issues fixed by merged PRs to CSV
+    if zombie_issues_merged_prs:
+        df_merged = pd.DataFrame(zombie_issues_merged_prs)
+        df_merged.to_csv("zombie_issues_merged_prs.csv", index=False)
+        print("Zombie issues fixed by merged PRs saved to zombie_issues_merged_prs.csv")
         
         # Print a summary
-        print("\nSummary of zombie issues:")
-        for i, issue in enumerate(zombie_issues):
+        print("\nSummary of zombie issues fixed by merged PRs:")
+        for i, issue in enumerate(zombie_issues_merged_prs):
             print(f"{i+1}. Issue #{issue['issue_number']}: {issue['issue_title']}")
-            print(f"   Likely fixed by PR #{issue['pr_number']}: {issue['pr_title']}")
+            print(f"   Fixed by PR #{issue['pr_number']}: {issue['pr_title']}")
             print(f"   Confidence: {issue['confidence']}")
             print()
     else:
-        print("No zombie issues found.")
+        print("No zombie issues fixed by merged PRs found.")
+    
+    # Save zombie issues fixed by open PRs to CSV
+    if zombie_issues_open_prs:
+        df_open = pd.DataFrame(zombie_issues_open_prs)
+        df_open.to_csv("zombie_issues_open_prs.csv", index=False)
+        print("Zombie issues fixed by open PRs saved to zombie_issues_open_prs.csv")
+        
+        # Print a summary
+        print("\nSummary of zombie issues fixed by open PRs:")
+        for i, issue in enumerate(zombie_issues_open_prs):
+            print(f"{i+1}. Issue #{issue['issue_number']}: {issue['issue_title']}")
+            print(f"   Potentially fixed by PR #{issue['pr_number']}: {issue['pr_title']}")
+            print(f"   Confidence: {issue['confidence']}")
+            print()
+    else:
+        print("No zombie issues fixed by open PRs found.")
 
 if __name__ == "__main__":
     main()
