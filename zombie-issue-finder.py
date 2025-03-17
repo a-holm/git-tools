@@ -194,14 +194,22 @@ def ai_analyze_potential_fixes(issue, pr_data):
     pr_number = pr_data["number"]
     
     # Get the commits from this PR
-    commits = get_pr_commits(pr_number)
+    try:
+        commits = get_pr_commits(pr_number)
+    except: # try again after a few seconds
+        time.sleep(30)
+        commits = get_pr_commits(pr_number)
     
     # Get diffs for the commits
     commit_diffs = []
     for commit in commits[:10]:  # Limit to first 10 commits to avoid too much content
         commit_sha = commit["sha"]
         commit_message = commit["commit"]["message"]
-        diff = get_commit_diff(commit_sha)
+        try:
+            diff = get_commit_diff(commit_sha)
+        except: # try again after a few seconds
+            time.sleep(30)
+            diff = get_commit_diff(commit_sha) 
         
         # Limit diff size to avoid token limits
         if len(diff) > 7000:
@@ -236,12 +244,12 @@ def ai_analyze_potential_fixes(issue, pr_data):
     Based on the issue description and the changes in the PR, please analyze:
     1. Does this PR appear to fix the issue described?
     2. What specific changes in the PR address the issue, if any?
-    3. How confident are you that this PR resolves the issue (High, Medium, Low)?
+    3. How confident are you that this PR resolves the issue (Certain, High, Medium, Low)?
     
     Respond in JSON format with these keys:
     {
         "likely_fixes_issue": true/false,
-        "confidence": "High/Medium/Low",
+        "confidence": "Certain/High/Medium/Low",
         "reasoning": "Your detailed explanation here",
         "relevant_changes": "Description of specific changes that address the issue"
     }
@@ -304,12 +312,10 @@ def find_zombie_issues():
             
             if pr["merged"] and datetime.strptime(pr["merged_at"], "%Y-%m-%dT%H:%M:%SZ") < issue_created_at:
                 continue
-                
-            print(f"  Checking against PR #{pr['number']} ({pr['state']}, base: {pr['base_branch']})")
             
             analysis = ai_analyze_potential_fixes(issue, pr)
             
-            if analysis.get("likely_fixes_issue") and analysis.get("confidence") in ["High", "Medium"]:
+            if analysis.get("likely_fixes_issue") and analysis.get("confidence") in ["Certain", "High", "Medium"]:
                 # Flattened data structure
                 candidate = {
                     # Issue info
@@ -343,10 +349,10 @@ def find_zombie_issues():
                 print(f"    ✓ Potential fix found with {analysis.get('confidence')} confidence")
                 
                 # Break condition for merged PRs targeting main
-                if (analysis.get('confidence') == 'High' 
+                if (analysis.get('confidence') in ['High', 'Certain']
                     and pr['merged'] 
                     and pr['base_branch'] == 'main'):
-                    print("    🚨 High confidence merged fix for main branch - moving to next issue")
+                    print(f"    🚨 {analysis.get('confidence')} confidence merged fix for main branch - moving to next issue")
                     break
     
     return zombie_issues_merged_prs, zombie_issues_open_prs

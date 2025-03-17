@@ -19,8 +19,8 @@ REPO_OWNER = "mannaandpoem"
 REPO_NAME = "OpenManus"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-MODEL_NAME = "gemini-2.0-flash"  # Set model here
-RATE_LIMIT = 2000  # Requests per minute
+MODEL_NAME = "gemini-2.0-flash-thinking-exp"  # Set model here
+RATE_LIMIT = 10  # Requests per minute
 # ===============================
 
 # Initialize rate limiting
@@ -175,7 +175,7 @@ def find_duplicates(issues, threshold=0.85):
     
     return potential_duplicates
 
-def find_ai_suggested_duplicates(issues, max_pairs=100):
+def find_ai_suggested_duplicates(issues):
     """Use Gemini AI to identify potential duplicate issues."""
     ai_suggested_duplicates = []
     pairs_checked = 0
@@ -185,7 +185,7 @@ def find_ai_suggested_duplicates(issues, max_pairs=100):
     
     for i, j in combinations(range(len(issues)), 2):
         # print for every 1000 pairs
-        if pairs_checked % 1000 == 0:
+        if pairs_checked % 100 == 0:
             print(f"Checked {pairs_checked} pairs so far...")
 
         issue1 = issues[i]
@@ -255,6 +255,10 @@ def main():
             'fix_notes': fix_notes      # New column
         })
     
+    # Output results
+    df_issues = pd.DataFrame(categorized_issues)
+    df_issues.to_csv("categorized_issues.csv", index=False)
+
     # Find potential duplicates using TF-IDF
     print("Finding potential duplicates using TF-IDF...")
     tfidf_duplicates = find_duplicates(issues)
@@ -262,10 +266,6 @@ def main():
     # Find potential duplicates using AI
     print("Finding potential duplicates using AI...")
     ai_duplicates = find_ai_suggested_duplicates(issues)
-    
-    # Output results
-    df_issues = pd.DataFrame(categorized_issues)
-    df_issues.to_csv("categorized_issues.csv", index=False)
     
     df_tfidf_duplicates = pd.DataFrame(tfidf_duplicates)
     if not df_tfidf_duplicates.empty:
